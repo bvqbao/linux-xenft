@@ -61,6 +61,7 @@
 #include <linux/migrate.h>
 #include <linux/hugetlb.h>
 #include <linux/sched/rt.h>
+#include <xen/interface/memory.h>
 #include <linux/sched/mm.h>
 #include <linux/page_owner.h>
 #include <linux/kthread.h>
@@ -72,6 +73,8 @@
 #include <asm/sections.h>
 #include <asm/tlbflush.h>
 #include <asm/div64.h>
+#include <asm/hypervisor.h>
+#include <asm/xen/hypercall.h>
 #include "internal.h"
 
 /* prevent >1 _updater_ of zone percpu pageset ->high and ->batch fields */
@@ -771,6 +774,145 @@ static inline int page_is_buddy(struct page *page, struct page *buddy,
 	return 0;
 }
 
+#ifdef CONFIG_XEN
+
+#define XENMEM_BATCH_SPLITORDER   2
+#define XENMEM_BATCH_SPLITSIZE   (1ul << XENMEM_BATCH_SPLITORDER)
+
+struct xen_page_mapping_queue
+{
+	uint64_t   size;
+	spinlock_t lock;
+	uint64_t   pfns[XENMEM_BATCH_MAXSIZE];
+	uint32_t   cpus[XENMEM_BATCH_MAXSIZE];
+	uint32_t   operations[XENMEM_BATCH_MAXSIZE];
+	uint64_t   tickets[XENMEM_BATCH_MAXSIZE];
+};
+
+static struct xen_page_mapping_queue __queues[XENMEM_BATCH_SPLITSIZE];
+static int __queues_initialized = 0;
+
+static DEFINE_SPINLOCK(__initqueue_lock);
+
+static atomic64_t __queue_clock;
+
+static void __xen_mapping_hypercall(struct xen_page_mapping_queue *queue)
+{
+	struct xen_page_mapping xarg;
+
+	xarg.size = queue->size;
+	xarg.pfns = queue->pfns;
+	xarg.cpus = queue->cpus;
+	xarg.operations = queue->operations;
+	xarg.tickets = queue->tickets;
+
+	HYPERVISOR_memory_op(XENMEM_page_mapping, &xarg);
+
+	queue->size = 0;
+}
+
+static inline void __ensure_queues_initialized(void)
+{
+	unsigned int i;
+	
+	if (__queues_initialized)
+		return;
+
+	spin_lock(&__initqueue_lock);
+
+	if (__queues_initialized)
+		goto unlock;
+
+	for (i = 0; i < XENMEM_BATCH_SPLITSIZE; i++)
+		spin_lock_init(&__queues[i].lock);
+
+	__queues_initialized = 1;
+
+ unlock:
+	spin_unlock(&__initqueue_lock);
+}
+
+static inline unsigned int __pfn_split_index(uint64_t pfn)
+{
+	return (pfn & ((1ul << XENMEM_BATCH_SPLITORDER) - 1));
+}
+
+static void __hypervisor_unmap_page(struct page *page, unsigned int order)
+{
+	struct xen_page_mapping_queue *queue;
+	unsigned int split_index;
+	unsigned long max, i;
+	uint64_t xindex;
+	uint64_t pfn;
+
+	if (x86_hyper == &x86_hyper_xen_hvm) {
+		pfn = page_to_pfn(page);
+		max = 1ul << order;
+
+		__ensure_queues_initialized();
+
+		for (i = 0; i < max; i++) {
+			split_index = __pfn_split_index(pfn + i);
+			queue = &__queues[split_index];
+
+			spin_lock(&queue->lock);
+
+			xindex = queue->size++;
+			queue->pfns[xindex] = pfn + i;
+			queue->cpus[xindex] = smp_processor_id();
+			queue->operations[xindex] = XENMEM_page_mapping_unmap;
+			queue->tickets[xindex] =
+				atomic64_inc_return(&__queue_clock);
+
+			if (queue->size >= XENMEM_BATCH_SENDSIZE)
+				__xen_mapping_hypercall(queue);
+
+			spin_unlock(&queue->lock);
+		}
+	}
+}
+
+static void __hypervisor_remap_page(struct page *page, unsigned int order)
+{
+	struct xen_page_mapping_queue *queue;
+	unsigned int split_index;
+	unsigned long max, i;
+	uint64_t xindex;
+	uint64_t pfn;
+
+	if (x86_hyper == &x86_hyper_xen_hvm) {
+		pfn = page_to_pfn(page);
+		max = 1ul << order;
+
+		__ensure_queues_initialized();
+		
+		for (i = 0; i < max; i++) {
+			split_index = __pfn_split_index(pfn + i);
+			queue = &__queues[split_index];
+
+			spin_lock(&queue->lock);
+
+			xindex = queue->size++;
+			queue->pfns[xindex] = pfn + i;
+			queue->cpus[xindex] = smp_processor_id();
+			queue->operations[xindex] = XENMEM_page_mapping_remap;
+			queue->tickets[xindex] =
+				atomic64_inc_return(&__queue_clock);
+
+			if (queue->size >= XENMEM_BATCH_SENDSIZE)
+				__xen_mapping_hypercall(queue);
+
+			spin_unlock(&queue->lock);
+		}
+	}
+}
+#else
+
+#define __hypervisor_unmap_page(page, order) {}
+#define __hypervisor_remap_page(page, order) {}
+
+#endif /* CONFIG_XEN */
+
 /*
  * Freeing function for a buddy system allocator.
  *
@@ -801,8 +943,10 @@ static inline void __free_one_page(struct page *page,
 		struct zone *zone, unsigned int order,
 		int migratetype)
 {
+	unsigned int callorder = order;
 	unsigned long combined_pfn;
 	unsigned long uninitialized_var(buddy_pfn);
+	struct page *callpage = page;
 	struct page *buddy;
 	unsigned int max_order;
 
@@ -895,6 +1039,7 @@ done_merging:
 
 	list_add(&page->lru, &zone->free_area[order].free_list[migratetype]);
 out:
+	__hypervisor_unmap_page(callpage, callorder);
 	zone->free_area[order].nr_free++;
 }
 
@@ -2304,6 +2449,8 @@ retry:
 			goto retry;
 	}
 
+	__hypervisor_remap_page(page, order);
+
 	trace_mm_page_alloc_zone_locked(page, order, migratetype);
 	return page;
 }
@@ -2708,6 +2855,8 @@ int __isolate_free_page(struct page *page, unsigned int order)
 
 		__mod_zone_freepage_state(zone, -(1UL << order), mt);
 	}
+
+	__hypervisor_remap_page(page, order);
 
 	/* Remove page from free list */
 	list_del(&page->lru);

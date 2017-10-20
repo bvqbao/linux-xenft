@@ -313,4 +313,20 @@ struct xen_vnuma_topology_info {
 typedef struct xen_vnuma_topology_info xen_vnuma_topology_info_t;
 DEFINE_GUEST_HANDLE(xen_vnuma_topology_info_t);
 
+#define XENMEM_BATCH_MAXSIZE           128
+#define XENMEM_BATCH_SENDSIZE           32
+
+#define XENMEM_page_mapping             42
+#define XENMEM_page_mapping_unmap        0
+#define XENMEM_page_mapping_remap        1
+
+struct xen_page_mapping {
+    uint64_t size;
+    GUEST_HANDLE(uint64_t) pfns;
+    GUEST_HANDLE(uint32_t) cpus;
+    GUEST_HANDLE(uint32_t) operations;
+    GUEST_HANDLE(uint64_t) tickets;
+};
+DEFINE_GUEST_HANDLE_STRUCT(xen_page_mapping);
+
 #endif /* __XEN_PUBLIC_MEMORY_H__ */
