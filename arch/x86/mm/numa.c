@@ -17,6 +17,7 @@
 #include <asm/dma.h>
 #include <asm/amd_nb.h>
 
+#include "asm/xen/vnuma.h"
 #include "numa_internal.h"
 
 int numa_off;
@@ -709,6 +710,8 @@ static int __init dummy_numa_init(void)
 void __init x86_numa_init(void)
 {
 	if (!numa_off) {
+		if (!numa_init(xen_numa_init))
+			return;
 #ifdef CONFIG_ACPI_NUMA
 		if (!numa_init(x86_acpi_numa_init))
 			return;
